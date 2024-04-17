@@ -237,6 +237,8 @@ namespace GaussianSplatting.Runtime
         public Shader m_ShaderDebugBoxes;
         [Tooltip("Gaussian splatting compute shader")]
         public ComputeShader m_CSSplatUtilities;
+        [Tooltip("Sorting compute shader")]
+        public ComputeShader sortCompute;
 
         int m_SplatCount; // initially same as asset splat count, but editing can change this
         GraphicsBuffer m_GpuSortDistances;
@@ -421,13 +423,23 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.SetBuffer((int)KernelIndices.SetIndices, Props.SplatSortKeys, m_GpuSortKeys);
             m_CSSplatUtilities.SetInt(Props.SplatCount, m_GpuSortDistances.count);
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.SetIndices, out uint gsX, out _, out _);
-            m_CSSplatUtilities.Dispatch((int)KernelIndices.SetIndices, (m_GpuSortDistances.count + (int)gsX - 1)/(int)gsX, 1, 1);
+            m_CSSplatUtilities.Dispatch((int)KernelIndices.SetIndices, (m_GpuSortDistances.count + (int)gsX - 1) / (int)gsX, 1, 1);
 
             m_SorterArgs.inputKeys = m_GpuSortDistances;
             m_SorterArgs.inputValues = m_GpuSortKeys;
-            m_SorterArgs.count = (uint)count;
-            if (m_Sorter.Valid)
-                m_SorterArgs.resources = GpuSorting.SupportResources.Load((uint)count);
+
+            int sortKernelIndex = sortCompute.FindKernel(SORT_KERNEL_NAME);
+            int batcherKernelIndex = sortCompute.FindKernel(BATCHERMERGE_KERNEL_NAME);
+
+            // m_GpuSortKeys has to get sorted
+            sortCompute.SetBuffer(sortKernelIndex, INDEX_BUFFER_NAME, m_GpuSortKeys);
+            sortCompute.SetBuffer(batcherKernelIndex, INDEX_BUFFER_NAME, m_GpuSortKeys);
+
+            sortCompute.SetBuffer(sortKernelIndex, "_SplatChunks", m_GpuChunks);
+            sortCompute.SetBuffer(batcherKernelIndex, "_SplatChunks", m_GpuChunks);
+
+            sortCompute.SetBuffer(sortKernelIndex, "_SplatPos", m_GpuChunks);    
+            sortCompute.SetBuffer(batcherKernelIndex, "_SplatPos", m_GpuChunks);
         }
 
         public void OnEnable()
@@ -575,6 +587,19 @@ namespace GaussianSplatting.Runtime
             cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);
         }
 
+        public const int MIN_ARRAY_LENGTH = BATCHERMERGE_WORK_GROUP_SIZE;
+        const int SORT_THREAD_GROUP_SIZE = 16;
+        const int SORT_WORK_GROUP_SIZE = 2 * SORT_THREAD_GROUP_SIZE;
+        const int BATCHERMERGE_WORK_GROUP_SIZE = 2 * SORT_WORK_GROUP_SIZE;
+        
+        const string SORT_KERNEL_NAME = "Sort";
+        const string BATCHERMERGE_KERNEL_NAME = "BatcherMerge";
+        const string INDEX_BUFFER_NAME = "Indices";
+        const string VALUE_BUFFER_NAME = "Values";
+        const string TARGET_VARIABLE_NAME = "Target";
+        const string GROUPCOUNT_VARIABLE_NAME = "groupCount";
+        const string ISODDDISPATCH_VARIABLE_NAME = "isOddDispatch";
+
         internal void SortPoints(CommandBuffer cmd, Camera cam, Matrix4x4 matrix)
         {
             if (cam.cameraType == CameraType.Preview)
@@ -585,22 +610,30 @@ namespace GaussianSplatting.Runtime
             worldToCamMatrix.m21 *= -1;
             worldToCamMatrix.m22 *= -1;
 
-            // calculate distance to the camera for each splat
-            cmd.BeginSample(s_ProfSort);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatSortDistances, m_GpuSortDistances);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatSortKeys, m_GpuSortKeys);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatChunks, m_GpuChunks);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatPos, m_GpuPosData);
-            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)m_Asset.posFormat);
-            cmd.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, worldToCamMatrix * matrix);
-            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
-            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
-            m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcDistances, out uint gsX, out _, out _);
-            cmd.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, (m_GpuSortDistances.count + (int)gsX - 1)/(int)gsX, 1, 1);
+            int sortKernelIndex = sortCompute.FindKernel(SORT_KERNEL_NAME);
+            int batcherKernelIndex = sortCompute.FindKernel(BATCHERMERGE_KERNEL_NAME);
 
-            // sort the splats
-            m_Sorter.Dispatch(cmd, m_SorterArgs);
-            cmd.EndSample(s_ProfSort);
+            sortCompute.SetVector(TARGET_VARIABLE_NAME, cam.transform.position);
+            sortCompute.SetMatrix(Props.MatrixMV, worldToCamMatrix * matrix);
+
+            int numThreadGroups = Mathf.CeilToInt((float) m_GpuSortKeys.count / SORT_WORK_GROUP_SIZE);
+
+            // SORT
+            sortCompute.Dispatch(sortKernelIndex, numThreadGroups, 1, 1);
+
+            // BATCHER MERGE
+            bool isOddDispatch = false;
+            int passCount = m_GpuSortKeys.count / SORT_WORK_GROUP_SIZE;
+            numThreadGroups = Mathf.CeilToInt((float)m_GpuSortKeys.count / BATCHERMERGE_WORK_GROUP_SIZE);
+
+            sortCompute.SetInt(GROUPCOUNT_VARIABLE_NAME, numThreadGroups);
+            for (int i = 0; i < passCount; i++)
+            {
+                sortCompute.SetBool(ISODDDISPATCH_VARIABLE_NAME, isOddDispatch);
+                sortCompute.Dispatch(batcherKernelIndex, numThreadGroups, 1, 1);
+
+                isOddDispatch = !isOddDispatch;
+            }
         }
 
         public void Update()
