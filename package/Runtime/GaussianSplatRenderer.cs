@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
@@ -10,6 +11,7 @@ using Unity.Profiling.LowLevel;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
+using Debug = UnityEngine.Debug;
 
 namespace GaussianSplatting.Runtime
 {
@@ -435,11 +437,8 @@ namespace GaussianSplatting.Runtime
             sortCompute.SetBuffer(sortKernelIndex, INDEX_BUFFER_NAME, m_GpuSortKeys);
             sortCompute.SetBuffer(batcherKernelIndex, INDEX_BUFFER_NAME, m_GpuSortKeys);
 
-            sortCompute.SetBuffer(sortKernelIndex, "_SplatChunks", m_GpuChunks);
-            sortCompute.SetBuffer(batcherKernelIndex, "_SplatChunks", m_GpuChunks);
-
-            sortCompute.SetBuffer(sortKernelIndex, "_SplatPos", m_GpuChunks);    
-            sortCompute.SetBuffer(batcherKernelIndex, "_SplatPos", m_GpuChunks);
+            sortCompute.SetBuffer(sortKernelIndex, VALUE_BUFFER_NAME, m_GpuSortDistances);
+            sortCompute.SetBuffer(batcherKernelIndex, VALUE_BUFFER_NAME, m_GpuSortDistances);
         }
 
         public void OnEnable()
@@ -595,10 +594,12 @@ namespace GaussianSplatting.Runtime
         const string SORT_KERNEL_NAME = "Sort";
         const string BATCHERMERGE_KERNEL_NAME = "BatcherMerge";
         const string INDEX_BUFFER_NAME = "Indices";
-        const string VALUE_BUFFER_NAME = "Values";
-        const string TARGET_VARIABLE_NAME = "Target";
+        const string VALUE_BUFFER_NAME = "Distances";
         const string GROUPCOUNT_VARIABLE_NAME = "groupCount";
         const string ISODDDISPATCH_VARIABLE_NAME = "isOddDispatch";
+
+        uint[] cache;
+        uint[] cacheKeys;
 
         internal void SortPoints(CommandBuffer cmd, Camera cam, Matrix4x4 matrix)
         {
@@ -610,11 +611,39 @@ namespace GaussianSplatting.Runtime
             worldToCamMatrix.m21 *= -1;
             worldToCamMatrix.m22 *= -1;
 
+            Debug.Log("Calculating distances");
+
+            // Calculate distances
+            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatSortDistances, m_GpuSortDistances);
+            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatSortKeys, m_GpuSortKeys);
+            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatChunks, m_GpuChunks);
+            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatPos, m_GpuPosData);
+            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)m_Asset.posFormat);
+            cmd.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, worldToCamMatrix * matrix);
+            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
+            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
+            m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcDistances, out uint gsX, out _, out _);
+            cmd.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, (m_GpuSortDistances.count + (int)gsX - 1) / (int)gsX, 1, 1);
+
+            if (cache == null)
+                cache = new uint[m_GpuSortKeys.count];
+
+            if (cacheKeys == null)
+                cacheKeys = new uint[m_GpuSortKeys.count];
+
+            m_GpuSortDistances.GetData(cache);
+            m_GpuSortKeys.GetData(cacheKeys);
+
+            for (int i = 0; i < cache.Length; i += cache.Length / 8)
+            {
+                UnityEngine.Debug.Log(i + " " + cacheKeys[i] + " " + cache[i] + " " + (cache[i] < cache[i + 1]));
+            }
+
+            Debug.Log("Sorting...");
+
+            // Sort
             int sortKernelIndex = sortCompute.FindKernel(SORT_KERNEL_NAME);
             int batcherKernelIndex = sortCompute.FindKernel(BATCHERMERGE_KERNEL_NAME);
-
-            sortCompute.SetVector(TARGET_VARIABLE_NAME, cam.transform.position);
-            sortCompute.SetMatrix(Props.MatrixMV, worldToCamMatrix * matrix);
 
             int numThreadGroups = Mathf.CeilToInt((float) m_GpuSortKeys.count / SORT_WORK_GROUP_SIZE);
 
@@ -634,6 +663,16 @@ namespace GaussianSplatting.Runtime
 
                 isOddDispatch = !isOddDispatch;
             }
+
+            m_GpuSortDistances.GetData(cache);
+            m_GpuSortKeys.GetData(cacheKeys);
+
+            for (int i = 0; i < cache.Length; i += cache.Length / 8)
+            {
+                UnityEngine.Debug.Log(i + " " + cacheKeys[i] + " " + cache[i] + " " + (cache[i] < cache[i + 1]));
+            }
+
+            Debug.Log("Sorted");
         }
 
         public void Update()
